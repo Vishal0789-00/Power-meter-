@@ -137,6 +137,11 @@ app.innerHTML = `
         Upload floors
       </h2>
 
+      <p class="muted">
+        Crop each image tightly around the
+        8 meter panels before uploading.
+      </p>
+
       <label>
         Reading date
 
@@ -287,6 +292,8 @@ for (
     );
 
 }
+
+
 const authCard =
   document.querySelector('#authCard');
 
@@ -319,15 +326,19 @@ async function refreshSession() {
     await supabase.auth.getSession();
 
   if (error) {
+
     setAuthMessage(
       error.message,
       'error'
     );
+
     return;
   }
 
+
   const loggedIn =
     Boolean(data.session);
+
 
   authCard.classList.toggle(
     'hidden',
@@ -343,6 +354,7 @@ async function refreshSession() {
     'hidden',
     !loggedIn
   );
+
 
   if (loggedIn) {
     await loadSavedReadings();
@@ -366,6 +378,7 @@ document
         .querySelector('#password')
         .value;
 
+
     const {
       error
     } =
@@ -374,6 +387,7 @@ document
           email,
           password
         });
+
 
     if (error) {
 
@@ -385,10 +399,12 @@ document
       return;
     }
 
+
     setAuthMessage(
       'Signed in.',
       'ok'
     );
+
 
     await refreshSession();
   };
@@ -410,6 +426,7 @@ document
         .querySelector('#password')
         .value;
 
+
     const {
       error
     } =
@@ -418,6 +435,7 @@ document
           email,
           password
         });
+
 
     setAuthMessage(
       error
@@ -435,6 +453,7 @@ logoutBtn.onclick =
 
     await supabase.auth.signOut();
 
+
     if (worker) {
 
       await worker.terminate();
@@ -442,562 +461,387 @@ logoutBtn.onclick =
       worker = null;
     }
 
+
     await refreshSession();
   };
-
-
 async function getWorker() {
+  if (worker) return worker;
 
-  if (worker) {
-    return worker;
-  }
+  const status = document.querySelector('#status');
+  status.textContent = 'Loading OCR...';
 
-  const status =
-    document.querySelector(
-      '#status'
-    );
-
-  status.textContent =
-    'Loading free OCR engine...';
-
-
-  worker =
-    await createWorker(
-      'eng',
-      1,
-      {
-        logger: message => {
-
-          if (
-            message.status &&
-            typeof message.progress ===
-              'number'
-          ) {
-
-            const percent =
-              Math.round(
-                message.progress * 100
-              );
-
-            status.textContent =
-              `${message.status} ${percent}%`;
-          }
-        }
+  worker = await createWorker('eng', 1, {
+    logger: m => {
+      if (m.status && typeof m.progress === 'number') {
+        status.textContent =
+          `${m.status} ${Math.round(m.progress * 100)}%`;
       }
-    );
-
-
-  await worker.setParameters({
-    tessedit_pageseg_mode:
-      PSM.SINGLE_BLOCK
+    }
   });
 
+  await worker.setParameters({
+    tessedit_pageseg_mode: PSM.SINGLE_LINE,
+    tessedit_char_whitelist: '0123456789.'
+  });
 
   return worker;
 }
 
 
-function imageSize(file) {
+function loadImage(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
 
-  return new Promise(
-    (resolve, reject) => {
+    img.onload = () => {
+      URL.revokeObjectURL(img.src);
+      resolve(img);
+    };
 
-      const image =
-        new Image();
+    img.onerror = () => {
+      URL.revokeObjectURL(img.src);
+      reject(new Error('Could not open image.'));
+    };
 
-      image.onload =
-        () => {
-
-          resolve({
-            width:
-              image.naturalWidth,
-
-            height:
-              image.naturalHeight
-          });
-
-        };
+    img.src = URL.createObjectURL(file);
+  });
+}
 
 
-      image.onerror =
-        () => {
+function cropPanel(image, panel, row) {
+  const w = image.naturalWidth / 8;
+  const left = Math.round(panel * w);
+  const right = panel === 7
+    ? image.naturalWidth
+    : Math.round((panel + 1) * w);
 
-          reject(
-            new Error(
-              'Could not open image.'
-            )
-          );
+  const width = right - left;
 
-        };
+  const topRatio = row === 'kwh' ? 0.53 : 0.76;
+  const bottomRatio = row === 'kwh' ? 0.78 : 0.995;
+
+  const top = Math.floor(
+    image.naturalHeight * topRatio
+  );
+
+  const height = Math.max(
+    1,
+    Math.ceil(
+      image.naturalHeight * bottomRatio
+    ) - top
+  );
+
+  const scale = 4;
+
+  const canvas = document.createElement('canvas');
+
+  canvas.width = width * scale;
+  canvas.height = height * scale;
+
+  const ctx = canvas.getContext('2d');
+
+  ctx.drawImage(
+    image,
+    left,
+    top,
+    width,
+    height,
+    0,
+    0,
+    canvas.width,
+    canvas.height
+  );
+
+  const data = ctx.getImageData(
+    0,
+    0,
+    canvas.width,
+    canvas.height
+  );
+
+  for (let i = 0; i < data.data.length; i += 4) {
+    const r = data.data[i];
+    const g = data.data[i + 1];
+    const b = data.data[i + 2];
+
+    let gray =
+      0.299 * r +
+      0.587 * g +
+      0.114 * b;
+
+    gray =
+      (gray - 110) * 2.2 + 128;
+
+    gray =
+      Math.max(0, Math.min(255, gray));
+
+    data.data[i] = gray;
+    data.data[i + 1] = gray;
+    data.data[i + 2] = gray;
+  }
+
+  ctx.putImageData(data, 0, 0);
+
+  return canvas;
+}
 
 
-      image.src =
-        URL.createObjectURL(
-          file
-        );
-    }
+function extractNumber(text) {
+  const matches =
+    String(text || '')
+      .replace(/[^0-9.]/g, ' ')
+      .match(/\d+(?:\.\d+)?/g);
+
+  if (!matches || !matches.length) {
+    return null;
+  }
+
+  matches.sort(
+    (a, b) => b.length - a.length
+  );
+
+  return matches[0];
+}
+
+
+async function readCrop(canvas) {
+  const ocr = await getWorker();
+
+  const result =
+    await ocr.recognize(canvas);
+
+  return extractNumber(
+    result?.data?.text || ''
   );
 }
 
 
-function numberFromText(
-  text,
-  labels
+async function readOnePanel(
+  image,
+  panel
 ) {
+  const status =
+    document.querySelector('#status');
 
-  const lines =
-    text
-      .split(/\r?\n/)
-      .map(
-        line =>
-          line.trim()
-      )
-      .filter(Boolean);
+  status.textContent =
+    `Reading panel ${panel + 1} of 8...`;
 
+  const kwhCanvas =
+    cropPanel(
+      image,
+      panel,
+      'kwh'
+    );
 
-  for (
-    const line
-    of lines
-  ) {
-
-    const lower =
-      line.toLowerCase();
-
-
-    if (
-      !labels.some(
-        label =>
-          lower.includes(label)
-      )
-    ) {
-      continue;
-    }
-
-
-    const matches =
-      line.match(
-        /\b\d{1,3}(?:[,\s]\d{3})*(?:\.\d+)?\b/g
-      );
-
-
-    if (
-      matches &&
-      matches.length
-    ) {
-
-      return matches[
-        matches.length - 1
-      ]
-        .replace(
-          /\s/g,
-          ''
-        )
-        .replace(
-          /,/g,
-          ''
-        );
-    }
-  }
-
-
-  return null;
-}
-
-
-function parseMeterText(
-  text,
-  position
-) {
+  const kvahCanvas =
+    cropPanel(
+      image,
+      panel,
+      'kvah'
+    );
 
   const kwh =
-    numberFromText(
-      text,
-      [
-        'total energy',
-        'total energ',
-        'energy'
-      ]
-    );
-
+    await readCrop(kwhCanvas);
 
   const kvah =
-    numberFromText(
-      text,
-      [
-        'apparent power per hour',
-        'apparent power',
-        'kvah',
-        'kvah'
-      ]
-    );
-
+    await readCrop(kvahCanvas);
 
   return {
-
-    position,
-
+    position: panel + 1,
     kwh,
-
     kvah,
-
     status:
       kwh && kvah
         ? 'OK'
         : 'REVIEW'
-
   };
 }
 
 
-async function readEightPanels(
-  file
-) {
-
-  const ocr =
-    await getWorker();
-
-  const size =
-    await imageSize(file);
-
-  const panelWidth =
-    Math.floor(
-      size.width / 8
-    );
+async function readEightPanels(file) {
+  const image =
+    await loadImage(file);
 
   const readings = [];
 
-
-  for (
-    let i = 0;
-    i < 8;
-    i++
-  ) {
-
-    const left =
-      i * panelWidth;
-
-
-    const width =
-      i === 7
-        ? size.width - left
-        : panelWidth;
-
-
-    const result =
-      await ocr.recognize(
-        file,
-        {
-          rectangle: {
-
-            left,
-
-            top: 0,
-
-            width,
-
-            height:
-              size.height
-
-          }
-        }
-      );
-
-
+  for (let i = 0; i < 8; i++) {
     readings.push(
-      parseMeterText(
-        result.data.text ||
-          '',
-        i + 1
+      await readOnePanel(
+        image,
+        i
       )
     );
-
-
-    document
-      .querySelector(
-        '#status'
-      )
-      .textContent =
-      `Reading panel ${i + 1} of 8...`;
   }
-
 
   return readings;
 }
+
+
 function buildRows(
   floorName,
   readingDate,
   readings
 ) {
-  return readings.map(
-    reading => {
+  return readings.map(r => {
+    const p = r.position;
 
-      const position =
-        reading.position;
-
-      return {
-        floor_name:
-          floorName,
-
-        side:
-          position <= 4
-            ? 'West'
-            : 'East',
-
-        meter_type:
-          position <= 4
-            ? METERS[position - 1]
-            : METERS[position - 5],
-
-        position,
-
-        kwh:
-          reading.kwh,
-
-        kvah:
-          reading.kvah,
-
-        status:
-          reading.status,
-
-        reading_date:
-          readingDate
-      };
-    }
-  );
+    return {
+      floor_name: floorName,
+      side: p <= 4 ? 'West' : 'East',
+      meter_type:
+        p <= 4
+          ? METERS[p - 1]
+          : METERS[p - 5],
+      position: p,
+      kwh: r.kwh,
+      kvah: r.kvah,
+      status: r.status,
+      reading_date: readingDate
+    };
+  });
 }
 
 
 async function saveRows(rows) {
-
   const {
-    data: userData,
-    error: userError
+    data,
+    error
   } =
     await supabase.auth.getUser();
 
+  if (error) throw error;
 
-  if (userError) {
-    throw userError;
-  }
-
-
-  if (!userData.user) {
+  if (!data.user) {
     throw new Error(
       'Please sign in again.'
     );
   }
 
-
-  const readingDate =
+  const date =
     document.querySelector(
       '#readingDate'
     ).value;
 
-
-  const floorNames =
-    [
-      ...new Set(
-        rows.map(
-          row =>
-            row.floor_name
-        )
+  const floors = [
+    ...new Set(
+      rows.map(
+        r => r.floor_name
       )
-    ];
+    )
+  ];
 
-
-  for (
-    const floorName
-    of floorNames
-  ) {
-
-    const {
-      error
-    } =
+  for (const floor of floors) {
+    const result =
       await supabase
-        .from(
-          'meter_readings'
-        )
+        .from('meter_readings')
         .delete()
-        .eq(
-          'user_id',
-          userData.user.id
-        )
-        .eq(
-          'reading_date',
-          readingDate
-        )
-        .eq(
-          'floor_name',
-          floorName
-        );
+        .eq('user_id', data.user.id)
+        .eq('reading_date', date)
+        .eq('floor_name', floor);
 
-
-    if (error) {
-      throw error;
+    if (result.error) {
+      throw result.error;
     }
   }
 
-
-  const {
-    error
-  } =
+  const result =
     await supabase
-      .from(
-        'meter_readings'
-      )
+      .from('meter_readings')
       .insert(
-        rows.map(
-          row => ({
-            ...row,
-            user_id:
-              userData.user.id
-          })
-        )
+        rows.map(r => ({
+          ...r,
+          user_id: data.user.id
+        }))
       );
 
-
-  if (error) {
-    throw error;
+  if (result.error) {
+    throw result.error;
   }
-}
-
-
+      }
 document
-  .querySelector(
-    '#processBtn'
-  )
-  .onclick =
-  async () => {
+  .querySelector('#processBtn')
+  .onclick = async () => {
 
     const status =
-      document.querySelector(
-        '#status'
-      );
+      document.querySelector('#status');
 
     const button =
-      document.querySelector(
-        '#processBtn'
-      );
+      document.querySelector('#processBtn');
 
     const uploads = [];
 
+    for (let i = 0; i < 6; i++) {
 
-    for (
-      let i = 0;
-      i < 6;
-      i++
-    ) {
-
-      if (!selectedFiles[i]) {
-        continue;
-      }
-
+      if (!selectedFiles[i]) continue;
 
       const floorName =
         document
-          .querySelector(
-            `#floorName${i}`
-          )
+          .querySelector(`#floorName${i}`)
           .value
           .trim();
 
-
       if (!floorName) {
-
         alert(
-          `Enter a floor name for slot ${i + 1}.`
+          `Enter floor name ${i + 1}.`
         );
-
         return;
       }
 
-
       uploads.push({
         floorName,
-        file:
-          selectedFiles[i]
+        file: selectedFiles[i]
       });
     }
 
-
     if (!uploads.length) {
-
       alert(
         'Upload at least one floor image.'
       );
-
       return;
     }
 
-
-    button.disabled =
-      true;
-
+    button.disabled = true;
 
     try {
 
-      const readingDate =
+      const date =
         document
-          .querySelector(
-            '#readingDate'
-          )
+          .querySelector('#readingDate')
           .value;
-
 
       const allRows = [];
 
-
-      for (
-        const upload
-        of uploads
-      ) {
+      for (const upload of uploads) {
 
         status.textContent =
           `Reading ${upload.floorName}...`;
-
 
         const readings =
           await readEightPanels(
             upload.file
           );
 
-
-        const rows =
-          buildRows(
-            upload.floorName,
-            readingDate,
-            readings
-          );
-
-
         allRows.push(
-          ...rows
+          ...buildRows(
+            upload.floorName,
+            date,
+            readings
+          )
         );
       }
-
 
       status.textContent =
         'Saving readings...';
 
+      await saveRows(allRows);
 
-      await saveRows(
-        allRows
-      );
-
-
-      renderResults(
-        allRows
-      );
-
+      renderResults(allRows);
 
       status.textContent =
-        'Finished. Review any rows marked REVIEW.';
-
+        'Finished. Review REVIEW values.';
 
     } catch (error) {
 
       console.error(error);
-
 
       status.textContent =
         `Error: ${
@@ -1005,242 +849,156 @@ document
           String(error)
         }`;
 
-
     } finally {
 
-      button.disabled =
-        false;
-
+      button.disabled = false;
     }
   };
 
 
 async function loadSavedReadings() {
 
-  const readingDate =
+  const date =
     document
-      .querySelector(
-        '#readingDate'
-      )
+      .querySelector('#readingDate')
       .value;
-
 
   const {
     data,
     error
   } =
     await supabase
-      .from(
-        'meter_readings'
-      )
+      .from('meter_readings')
       .select(
         'reading_date,floor_name,side,meter_type,kwh,kvah,status,position'
       )
       .eq(
         'reading_date',
-        readingDate
+        date
       )
       .order(
         'floor_name',
-        {
-          ascending:
-            true
-        }
+        { ascending: true }
       )
       .order(
         'position',
-        {
-          ascending:
-            true
-        }
+        { ascending: true }
       )
       .limit(500);
-
 
   if (error) {
 
     document
-      .querySelector(
-        '#results'
-      )
+      .querySelector('#results')
       .innerHTML =
-      `
-        <p class="message error">
-          ${escapeHtml(
-            error.message
-          )}
-        </p>
-      `;
+      `<p class="message error">
+        ${escapeHtml(error.message)}
+      </p>`;
 
     return;
   }
 
-
-  renderResults(
-    data || []
-  );
+  renderResults(data || []);
 }
 
 
 document
-  .querySelector(
-    '#readingDate'
-  )
+  .querySelector('#readingDate')
   .onchange =
   loadSavedReadings;
 
 
-function renderResults(
-  rows
-) {
+function renderResults(rows) {
 
   const results =
-    document.querySelector(
-      '#results'
-    );
-
+    document.querySelector('#results');
 
   if (!rows.length) {
 
     results.innerHTML =
-      `
-        <p class="muted">
-          No readings for this date yet.
-        </p>
-      `;
+      `<p class="muted">
+        No readings for this date yet.
+      </p>`;
 
     return;
   }
 
-
   const grouped = {};
 
+  rows.forEach(row => {
 
-  for (
-    const row
-    of rows
-  ) {
-
-    if (
-      !grouped[
-        row.floor_name
-      ]
-    ) {
-
-      grouped[
-        row.floor_name
-      ] = [];
+    if (!grouped[row.floor_name]) {
+      grouped[row.floor_name] = [];
     }
 
-
-    grouped[
-      row.floor_name
-    ].push(row);
-  }
-
+    grouped[row.floor_name].push(row);
+  });
 
   let html = '';
 
-
   for (
-    const [
-      floor,
-      floorRows
-    ]
-    of Object.entries(
-      grouped
-    )
+    const [floor, floorRows]
+    of Object.entries(grouped)
   ) {
 
     html += `
-      <section
-        class="floor-result"
-      >
+      <section class="floor-result">
 
         <h2>
-          ${escapeHtml(
-            floor
-          )}
+          ${escapeHtml(floor)}
         </h2>
 
-        <h3>
-          kWh
-        </h3>
+        <h3>kWh</h3>
 
         <table>
 
           <thead>
-
             <tr>
               <th>Meter</th>
               <th>West</th>
               <th>East</th>
             </tr>
-
           </thead>
 
           <tbody>
     `;
 
-
-    for (
-      const meter
-      of METERS
-    ) {
+    METERS.forEach(meter => {
 
       const west =
         floorRows.find(
-          row =>
-            row.meter_type ===
-              meter &&
-            row.side ===
-              'West'
+          r =>
+            r.meter_type === meter &&
+            r.side === 'West'
         );
-
 
       const east =
         floorRows.find(
-          row =>
-            row.meter_type ===
-              meter &&
-            row.side ===
-              'East'
+          r =>
+            r.meter_type === meter &&
+            r.side === 'East'
         );
-
 
       html += `
         <tr>
-
           <td>
-            ${escapeHtml(
-              meter
-            )}
+            ${escapeHtml(meter)}
           </td>
 
           <td>
-            ${escapeHtml(
-              west?.kwh ||
-                ''
-            )}
+            ${escapeHtml(west?.kwh || '')}
           </td>
 
           <td>
-            ${escapeHtml(
-              east?.kwh ||
-                ''
-            )}
+            ${escapeHtml(east?.kwh || '')}
           </td>
-
         </tr>
       `;
-    }
-
+    });
 
     html += `
           </tbody>
-
         </table>
-
 
         <button
           class="secondary copyBtn"
@@ -1254,86 +1012,57 @@ function renderResults(
           Copy kWh only
         </button>
 
-
-        <h3>
-          kVAh
-        </h3>
-
+        <h3>kVAh</h3>
 
         <table>
 
           <thead>
-
             <tr>
               <th>Meter</th>
               <th>West</th>
               <th>East</th>
             </tr>
-
           </thead>
 
           <tbody>
     `;
 
-
-    for (
-      const meter
-      of METERS
-    ) {
+    METERS.forEach(meter => {
 
       const west =
         floorRows.find(
-          row =>
-            row.meter_type ===
-              meter &&
-            row.side ===
-              'West'
+          r =>
+            r.meter_type === meter &&
+            r.side === 'West'
         );
-
 
       const east =
         floorRows.find(
-          row =>
-            row.meter_type ===
-              meter &&
-            row.side ===
-              'East'
+          r =>
+            r.meter_type === meter &&
+            r.side === 'East'
         );
-
 
       html += `
         <tr>
-
           <td>
-            ${escapeHtml(
-              meter
-            )}
+            ${escapeHtml(meter)}
           </td>
 
           <td>
-            ${escapeHtml(
-              west?.kvah ||
-                ''
-            )}
+            ${escapeHtml(west?.kvah || '')}
           </td>
 
           <td>
-            ${escapeHtml(
-              east?.kvah ||
-                ''
-            )}
+            ${escapeHtml(east?.kvah || '')}
           </td>
-
         </tr>
       `;
-    }
-
+    });
 
     html += `
           </tbody>
-
         </table>
-
 
         <button
           class="secondary copyBtn"
@@ -1348,119 +1077,83 @@ function renderResults(
         </button>
     `;
 
-
-    const reviewCount =
+    const reviews =
       floorRows.filter(
-        row =>
-          row.status ===
-            'REVIEW'
+        r =>
+          r.status === 'REVIEW'
       ).length;
 
-
-    if (
-      reviewCount
-    ) {
+    if (reviews) {
 
       html += `
-        <p
-          class="message error"
-        >
-          ${reviewCount}
-          reading(s)
-          need review.
+        <p class="message error">
+          ${reviews}
+          reading(s) need review.
         </p>
       `;
     }
-
 
     html += `
       </section>
     `;
   }
 
-
-  results.innerHTML =
-    html;
+  results.innerHTML = html;
 
 
   document
-    .querySelectorAll(
-      '.copyBtn'
-    )
-    .forEach(
-      button => {
+    .querySelectorAll('.copyBtn')
+    .forEach(button => {
 
-        button.onclick =
-          async () => {
+      button.onclick =
+        async () => {
 
-            const value =
-              decodeURIComponent(
-                button.dataset
-                  .copy ||
-                  ''
+          const value =
+            decodeURIComponent(
+              button.dataset.copy || ''
+            );
+
+          try {
+
+            await navigator
+              .clipboard
+              .writeText(value);
+
+          } catch {
+
+            const box =
+              document.createElement(
+                'textarea'
               );
 
+            box.value = value;
 
-            try {
+            document.body
+              .appendChild(box);
 
-              await navigator
-                .clipboard
-                .writeText(
-                  value
-                );
+            box.select();
 
-            } catch {
-
-              const textarea =
-                document
-                  .createElement(
-                    'textarea'
-                  );
-
-
-              textarea.value =
-                value;
-
-
-              document.body
-                .appendChild(
-                  textarea
-                );
-
-
-              textarea.select();
-
-
-              document
-                .execCommand(
-                  'copy'
-                );
-
-
-              textarea.remove();
-            }
-
-
-            const old =
-              button.textContent;
-
-
-            button.textContent =
-              '✓ Copied';
-
-
-            setTimeout(
-              () => {
-
-                button.textContent =
-                  old;
-
-              },
-              1200
+            document.execCommand(
+              'copy'
             );
-          };
-      }
-    );
+
+            box.remove();
+          }
+
+          const old =
+            button.textContent;
+
+          button.textContent =
+            '✓ Copied';
+
+          setTimeout(
+            () => {
+              button.textContent = old;
+            },
+            1200
+          );
+        };
+    });
 }
 
 
@@ -1470,58 +1163,45 @@ function makeCopy(
 ) {
 
   return METERS
-    .map(
-      meter => {
+    .map(meter => {
 
-        const west =
-          rows.find(
-            row =>
-              row.meter_type ===
-                meter &&
-              row.side ===
-                'West'
-          );
+      const west =
+        rows.find(
+          r =>
+            r.meter_type === meter &&
+            r.side === 'West'
+        );
 
+      const east =
+        rows.find(
+          r =>
+            r.meter_type === meter &&
+            r.side === 'East'
+        );
 
-        const east =
-          rows.find(
-            row =>
-              row.meter_type ===
-                meter &&
-              row.side ===
-                'East'
-          );
-
-
-        return `${
-          west?.[field] ||
-          ''
-        }\t${
-          east?.[field] ||
-          ''
-        }`;
-      }
-    )
+      return `${
+        west?.[field] || ''
+      }\t${
+        east?.[field] || ''
+      }`;
+    })
     .join('\n');
 }
 
 
-function escapeHtml(
-  value
-) {
+function escapeHtml(value) {
 
-  return String(
-    value
-  ).replace(
-    /[&<>"']/g,
-    character => ({
-      '&': '&amp;',
-      '<': '&lt;',
-      '>': '&gt;',
-      '"': '&quot;',
-      "'": '&#039;'
-    }[character])
-  );
+  return String(value)
+    .replace(
+      /[&<>"']/g,
+      c => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#039;'
+      }[c])
+    );
 }
 
 
