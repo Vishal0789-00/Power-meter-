@@ -1,1 +1,2 @@
-
+[functions.process-floor-images]
+verify_jwt = true
